@@ -94,9 +94,6 @@ jobs:
           $exe = Join-Path dist "$env:PYINSTALLER_NAME.exe"
           $h = (Get-FileHash -Path $exe -Algorithm SHA256).Hash
           $lines = @(
-            "Windows single-file executable (PyInstaller onefile, console window enabled for progress logs).",
-            "",
-            "File: $env:PYINSTALLER_NAME.exe",
             "SHA256: $h",
             "",
             "Logging: set environment variable VS_LOG_LEVEL (e.g. DEBUG, INFO)."
