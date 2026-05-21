@@ -9,7 +9,7 @@ import cv2
 import numexpr as ne
 import numpy as np
 
-from video_stabilizer.color import worker_yuv_to_float_bgr
+from video_stabilizer.color import _numexpr_lock, worker_yuv_to_float_bgr
 
 if TYPE_CHECKING:
     import av as _av
@@ -60,7 +60,7 @@ def get_stats_and_coeffs(
     u: np.ndarray,
     v: np.ndarray,
     stats_max_dim: int,
-) -> np.ndarray | None:
+) -> np.ndarray:
     max_dim = max(y.shape)
     scale = min(float(stats_max_dim) / max_dim, 1.0)
     new_w = max(int(y.shape[1] * scale), 1)
@@ -75,6 +75,99 @@ def get_stats_and_coeffs(
     y_std = np.std(small_y) + 1e-6
     s_mean = np.mean(hsv[:, :, 1]) + 1e-6
     return np.array([y_mean, y_std, s_mean], dtype=np.float32)
+
+
+def clamp_mitchell_t(t: float, t_max: float = 1.0) -> float:
+    return float(min(max(t, 0.0), t_max))
+
+
+def find_stats_segment_index(
+    stats_buffer: list[tuple[int, np.ndarray]],
+    frame_idx: int,
+) -> int:
+    """Return segment index j where stats_buffer[j][0] <= frame_idx <= stats_buffer[j+1][0].
+
+    When frame_idx is a keyframe shared by two segments, the later segment wins so
+    keyframe indices use the statistics sampled at that frame.
+    """
+    for j in range(len(stats_buffer) - 2, -1, -1):
+        if stats_buffer[j][0] <= frame_idx <= stats_buffer[j + 1][0]:
+            return j
+    return -1
+
+
+def interpolate_stats_for_frame(
+    frame_idx: int,
+    stats_buffer: list[tuple[int, np.ndarray]],
+    sampling_n: int,
+    t_max: float = 1.0,
+) -> np.ndarray | None:
+    """Interpolate [y_mean, y_std, s_mean] for frame_idx using Mitchell or linear fallback."""
+    if len(stats_buffer) < 2:
+        return None
+
+    target_j = find_stats_segment_index(stats_buffer, frame_idx)
+    if target_j == -1:
+        return None
+
+    p1 = stats_buffer[target_j][1]
+    p2 = stats_buffer[target_j + 1][1]
+    span = stats_buffer[target_j + 1][0] - stats_buffer[target_j][0]
+    if span > 0:
+        t = (frame_idx - stats_buffer[target_j][0]) / float(span)
+    else:
+        t = 0.0
+    t = clamp_mitchell_t(t, t_max)
+
+    linear = (1.0 - t) * p1 + t * p2
+
+    if target_j + 2 < len(stats_buffer):
+        p0 = stats_buffer[target_j - 1][1] if target_j >= 1 else p1
+        p3 = stats_buffer[target_j + 2][1]
+        mitchell = mitchell_netravali(t, [p0, p1, p2, p3])
+        if not np.all(np.isfinite(mitchell)):
+            return linear
+        lo = np.minimum.reduce([p0, p1, p2, p3])
+        hi = np.maximum.reduce([p0, p1, p2, p3])
+        if np.any(mitchell < lo) or np.any(mitchell > hi):
+            return linear
+        return mitchell
+
+    return linear
+
+
+def interpolate_stats_tail(
+    frame_idx: int,
+    stats_buffer: list[tuple[int, np.ndarray]],
+    sampling_n: int,
+    t_max: float = 1.0,
+) -> np.ndarray | None:
+    """End-of-stream interpolation with clamped t on the last segment."""
+    if len(stats_buffer) < 2:
+        return None
+
+    last_j = len(stats_buffer) - 2
+    p1 = stats_buffer[last_j][1]
+    p2 = stats_buffer[last_j + 1][1]
+    p0 = stats_buffer[last_j - 1][1] if last_j >= 1 else p1
+    p3_extrapolated = p2 + (p2 - p1)
+
+    span = stats_buffer[last_j + 1][0] - stats_buffer[last_j][0]
+    if span > 0:
+        t = (frame_idx - stats_buffer[last_j][0]) / float(span)
+    else:
+        t = 0.0
+    t = clamp_mitchell_t(t, t_max)
+
+    linear = (1.0 - t) * p1 + t * p2
+    mitchell = mitchell_netravali(t, [p0, p1, p2, p3_extrapolated])
+    if not np.all(np.isfinite(mitchell)):
+        return linear
+    lo = np.minimum.reduce([p0, p1, p2, p3_extrapolated])
+    hi = np.maximum.reduce([p0, p1, p2, p3_extrapolated])
+    if np.any(mitchell < lo) or np.any(mitchell > hi):
+        return linear
+    return mitchell
 
 
 def mitchell_netravali(t: float, p: list[np.ndarray]) -> np.ndarray:
@@ -103,7 +196,8 @@ def mitchell_netravali(t: float, p: list[np.ndarray]) -> np.ndarray:
         "_MN_C10": _MN_C10,
         "_MN_C11": _MN_C11,
     }
-    return ne.evaluate(expr, local_dict=local_dict)
+    with _numexpr_lock:
+        return ne.evaluate(expr, local_dict=local_dict)
 
 
 def init_ema_with_warmup(

@@ -40,9 +40,9 @@ def analyze_reference_video(ref_path: str, config: Config) -> np.ndarray | None:
                         pbar_ref.update(1)
                         continue
                     y, u, v = yuv
-                    s = get_stats_and_coeffs(y, u, v, config.stats_max_dim)
-                    if s is not None:
-                        ref_stats_list.append(s)
+                    ref_stats_list.append(
+                        get_stats_and_coeffs(y, u, v, config.stats_max_dim)
+                    )
                 pbar_ref.update(1)
         finally:
             pbar_ref.close()

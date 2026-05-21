@@ -1,4 +1,6 @@
 # 準備
+開発者向けの環境構築・ビルド・テスト手順は [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) を参照してください。
+
 ## 1. アプリケーションをDL
 画面側のReleasesタブから一番新しいバージョンをクリック
 SBC_VideoStabilizer_vXX.exe をクリックしてダウンロード
