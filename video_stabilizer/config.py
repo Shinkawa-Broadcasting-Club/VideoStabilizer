@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
+
+FrameFailurePolicy = Literal["hold", "black", "abort"]
 
 
 @dataclass(frozen=True)
@@ -31,7 +34,11 @@ class Config:
     tqdm_total_threshold: int = 1000
     stats_epsilon: float = 1e-6
     ref_stats_min_std: float = 1e-6
-    future_result_timeout_sec: float = 10.0
+    # hold: repeat last good frame; black: TV black; abort: stop and delete partial output
+    on_frame_failure: FrameFailurePolicy = "hold"
+    mitchell_t_max: float = 1.0
+    # Mux corrected video with audio stream copied from the source file
+    preserve_audio: bool = True
 
     @classmethod
     def from_env(cls) -> Config:
@@ -49,13 +56,33 @@ class Config:
                 return default
             return int(raw)
 
+        def _b(name: str, default: bool) -> bool:
+            raw = os.environ.get(name)
+            if raw is None or raw == "":
+                return default
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+
+        def _policy(name: str, default: FrameFailurePolicy) -> FrameFailurePolicy:
+            raw = os.environ.get(name)
+            if raw is None or raw == "":
+                return default
+            value = raw.strip().lower()
+            if value in ("hold", "black", "abort"):
+                return value  # type: ignore[return-value]
+            return default
+
         return cls(
             target_sampling_sec=_f("VS_TARGET_SAMPLING_SEC", cls.target_sampling_sec),
             ema_alpha=_f("VS_EMA_ALPHA", cls.ema_alpha),
-            chroma_soft_clip_threshold=_f("VS_CHROMA_SOFT_CLIP_THRESHOLD", cls.chroma_soft_clip_threshold),
+            chroma_soft_clip_threshold=_f(
+                "VS_CHROMA_SOFT_CLIP_THRESHOLD", cls.chroma_soft_clip_threshold
+            ),
             chroma_soft_clip_diff=_f("VS_CHROMA_SOFT_CLIP_DIFF", cls.chroma_soft_clip_diff),
             ratio_clip_low=_f("VS_RATIO_CLIP_LOW", cls.ratio_clip_low),
             ratio_clip_high=_f("VS_RATIO_CLIP_HIGH", cls.ratio_clip_high),
             stats_max_dim=_i("VS_STATS_MAX_DIM", cls.stats_max_dim),
             queue_multiplier=_i("VS_QUEUE_MULTIPLIER", cls.queue_multiplier),
+            on_frame_failure=_policy("VS_ON_FRAME_FAILURE", cls.on_frame_failure),
+            mitchell_t_max=_f("VS_MITCHELL_T_MAX", cls.mitchell_t_max),
+            preserve_audio=_b("VS_PRESERVE_AUDIO", cls.preserve_audio),
         )

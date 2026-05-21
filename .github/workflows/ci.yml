@@ -33,6 +33,9 @@ jobs:
       - name: Import smoke test
         run: python -c "import video_stabilizer.app"
 
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
   build:
     if: github.event_name != 'pull_request'
     runs-on: windows-latest
