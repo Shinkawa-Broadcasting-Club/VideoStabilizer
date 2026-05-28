@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,7 @@ import numpy as np
 from video_stabilizer.config import Config
 from video_stabilizer.pipeline import (
     _FrameWriteState,
+    _NullProgress,
     _drain_all_futures,
     _video_only_temp_path,
     process_target_video,
@@ -110,9 +112,32 @@ class _FakeStream:
     height = 4
 
 
+class _FakeStreamMissingRate:
+    frames = 0
+    duration = None
+    time_base = None
+    average_rate = None
+    guessed_rate = None
+    base_rate = None
+    width = 4
+    height = 4
+
+
 class _FakeContainer:
     def __init__(self) -> None:
         self.streams = SimpleNamespace(video=[_FakeStream()])
+
+    def decode(self, _stream):
+        for _ in range(3):
+            yield object()
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeContainerMissingRate:
+    def __init__(self) -> None:
+        self.streams = SimpleNamespace(video=[_FakeStreamMissingRate()])
 
     def decode(self, _stream):
         for _ in range(3):
@@ -142,7 +167,9 @@ class TestProcessTargetVideo(unittest.TestCase):
         fake_y = np.full((4, 4), 64, dtype=np.uint8)
         fake_u = np.full((2, 2), 128, dtype=np.uint8)
         fake_v = np.full((2, 2), 128, dtype=np.uint8)
-        fake_stats = np.array([100.0, 20.0, 50.0], dtype=np.float32)
+        fake_stats = np.array(
+            [100.0, 20.0, 128.0, 10.0, 128.0, 10.0, 50.0], dtype=np.float32
+        )
         fake_output = np.full((4, 4, 3), 32, dtype=np.uint8)
 
         with (
@@ -178,7 +205,9 @@ class TestProcessTargetVideo(unittest.TestCase):
         fake_y = np.full((4, 4), 64, dtype=np.uint8)
         fake_u = np.full((2, 2), 128, dtype=np.uint8)
         fake_v = np.full((2, 2), 128, dtype=np.uint8)
-        fake_stats = np.array([100.0, 20.0, 50.0], dtype=np.float32)
+        fake_stats = np.array(
+            [100.0, 20.0, 128.0, 10.0, 128.0, 10.0, 50.0], dtype=np.float32
+        )
         fake_output = np.full((4, 4, 3), 32, dtype=np.uint8)
 
         with (
@@ -207,6 +236,136 @@ class TestProcessTargetVideo(unittest.TestCase):
 
         self.assertFalse(ok)
         mock_remove.assert_any_call("out.mp4")
+
+
+class TestProgressAndCancel(unittest.TestCase):
+    def test_progress_callback_invoked(self) -> None:
+        fake_writer = _FakeVideoWriter()
+        fake_y = np.full((4, 4), 64, dtype=np.uint8)
+        fake_u = np.full((2, 2), 128, dtype=np.uint8)
+        fake_v = np.full((2, 2), 128, dtype=np.uint8)
+        fake_stats = np.array(
+            [100.0, 20.0, 128.0, 10.0, 128.0, 10.0, 50.0], dtype=np.float32
+        )
+        fake_output = np.full((4, 4, 3), 32, dtype=np.uint8)
+        calls: list[tuple[int, int | None]] = []
+
+        def progress_cb(cur: int, tot: int | None) -> None:
+            calls.append((cur, tot))
+
+        with (
+            patch("video_stabilizer.pipeline.av.open", return_value=_FakeContainer()),
+            patch("video_stabilizer.pipeline.cv2.VideoWriter", return_value=fake_writer),
+            patch("video_stabilizer.pipeline.cv2.VideoWriter_fourcc", return_value=0),
+            patch(
+                "video_stabilizer.pipeline.extract_yuv_planes",
+                return_value=(fake_y, fake_u, fake_v),
+            ),
+            patch(
+                "video_stabilizer.pipeline.get_stats_and_coeffs",
+                return_value=fake_stats,
+            ),
+            patch(
+                "video_stabilizer.pipeline.process_frame_worker",
+                return_value=fake_output,
+            ),
+            patch(
+                "video_stabilizer.pipeline.finalize_output_with_audio",
+                return_value=True,
+            ),
+        ):
+            ok = process_target_video(
+                "in.mp4",
+                "out.mp4",
+                fake_stats,
+                Config(use_gui_progress=True),
+                progress_cb=progress_cb,
+            )
+
+        self.assertTrue(ok)
+        self.assertGreater(len(calls), 0)
+
+    def test_cancel_event_aborts(self) -> None:
+        fake_writer = _FakeVideoWriter()
+        cancel = threading.Event()
+        cancel.set()
+        fake_stats = np.zeros(7, dtype=np.float32)
+
+        with (
+            patch("video_stabilizer.pipeline.av.open", return_value=_FakeContainer()),
+            patch("video_stabilizer.pipeline.cv2.VideoWriter", return_value=fake_writer),
+            patch("video_stabilizer.pipeline.cv2.VideoWriter_fourcc", return_value=0),
+            patch(
+                "video_stabilizer.pipeline.extract_yuv_planes",
+                return_value=None,
+            ),
+            patch(
+                "video_stabilizer.pipeline.finalize_output_with_audio",
+                return_value=True,
+            ),
+        ):
+            ok = process_target_video(
+                "in.mp4",
+                "out.mp4",
+                fake_stats,
+                Config(use_gui_progress=True),
+                cancel_event=cancel,
+            )
+
+        self.assertFalse(ok)
+
+    def test_missing_rate_metadata_uses_fallback_fps(self) -> None:
+        fake_writer = _FakeVideoWriter()
+        fake_y = np.full((4, 4), 64, dtype=np.uint8)
+        fake_u = np.full((2, 2), 128, dtype=np.uint8)
+        fake_v = np.full((2, 2), 128, dtype=np.uint8)
+        fake_stats = np.array(
+            [100.0, 20.0, 128.0, 10.0, 128.0, 10.0, 50.0], dtype=np.float32
+        )
+        fake_output = np.full((4, 4, 3), 32, dtype=np.uint8)
+
+        with (
+            patch(
+                "video_stabilizer.pipeline.av.open",
+                return_value=_FakeContainerMissingRate(),
+            ),
+            patch("video_stabilizer.pipeline.cv2.VideoWriter", return_value=fake_writer),
+            patch("video_stabilizer.pipeline.cv2.VideoWriter_fourcc", return_value=0),
+            patch(
+                "video_stabilizer.pipeline.extract_yuv_planes",
+                return_value=(fake_y, fake_u, fake_v),
+            ),
+            patch(
+                "video_stabilizer.pipeline.get_stats_and_coeffs",
+                return_value=fake_stats,
+            ),
+            patch(
+                "video_stabilizer.pipeline.process_frame_worker",
+                return_value=fake_output,
+            ),
+            patch(
+                "video_stabilizer.pipeline.finalize_output_with_audio",
+                return_value=True,
+            ),
+        ):
+            ok = process_target_video("in.mp4", "out.mp4", fake_stats, Config())
+
+        self.assertTrue(ok)
+
+
+class TestFrameWriteStateProgress(unittest.TestCase):
+    def test_null_progress_does_not_crash(self) -> None:
+        writer = _MockWriter()
+        state = _FrameWriteState(
+            writer,  # type: ignore[arg-type]
+            _NullProgress(),
+            Config(),
+            2,
+            2,
+            progress_cb=lambda c, t: None,
+        )
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        self.assertTrue(state.resolve(frame, 0))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 - Python 3.12
 - Windows 11 24H2
 
+
 ## 2. 環境構築
 ### 2.1 `uv` を使う（推奨）
 ```bash
@@ -19,30 +20,27 @@ python -m pip install -e .
 ```
 
 ## 3. 起動
+### GUI（既定）
 ```bash
-# uv使用時
 uv run video-stabilizer
+# または
+uv run python main.py
 ```
+
+### CLI（従来のファイルダイアログ）
 ```bash
-# pip+venv使用時
-python main.py
+uv run video-stabilizer --cli
+uv run python main.py --cli
 ```
 
 ## 4. テスト
-### 4.1 ユニットテスト
-
 ```bash
-# uv使用時
 uv run python -m unittest discover -s tests -v
 ```
-```bash
-# pip+venv使用時
-python -m unittest discover -s tests -v
-```
+
+受け入れ基準（KPI）: [ACCEPTANCE.md](ACCEPTANCE.md)
 
 ## 5. ビルド
-
-GitHub Actionsで実行しているCIと同じような動作をします
 
 ```powershell
 pyinstaller --onefile `
@@ -50,11 +48,10 @@ pyinstaller --onefile `
   --collect-binaries av `
   --collect-binaries cv2 `
   --collect-submodules numexpr `
-  --hidden-import tkinter `
-  --hidden-import tkinter.filedialog `
+  --exclude-module tkinter `
+  --windowed `
   main.py
 ```
-生成物は `dist/` 配下に出力されます。
 
 ## 6. 主要な環境変数
 ### ログ
@@ -72,6 +69,13 @@ pyinstaller --onefile `
 - `VS_ON_FRAME_FAILURE` (`hold` / `black` / `abort`)
 - `VS_MITCHELL_T_MAX`
 - `VS_PRESERVE_AUDIO` (`true` / `false`, 既定: `true`)
-  - `true`: 補正済み映像と元ファイルの音声を、最終拡張子のコンテナへ remux
-  - `false`: 音声なしで最終拡張子のコンテナへ remux
-  
+- `VS_COLLISION_POLICY` (`overwrite` / `skip` / `rename`)
+- `VS_OUTPUT_DIR`（統一出力フォルダ）
+- `VS_USE_GUI_PROGRESS`（GUI モードでは自動で true）
+
+## 7. UI 設定の保存場所
+- Windows: `%APPDATA%\VideoStabilizer\settings.json`
+- その他: `~/.video_stabilizer/settings.json`
+
+## 8. バッチ manifest
+出力フォルダ（または入力フォルダ）に `manifest.json` が生成されます。再実行時の「完了済みスキップ」「失敗のみ再試行」に使用します。

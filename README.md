@@ -1,23 +1,34 @@
-# 準備
-開発者向けの環境構築・ビルド・テスト手順は [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) を参照してください。
+# Video Stabilizer
 
-## 1. アプリケーションをDL
-画面側のReleasesタブから一番新しいバージョンをクリック
-SBC_VideoStabilizer_vXX.exe をクリックしてダウンロード
+参照映像のルック（輝度・コントラスト・色相・彩度）を、処理対象の動画へ転写する Windows 向けツールです。
 
-## 2 .実行
-ダウンロードした.exeをダブルクリック
+開発者向け: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 
-# 使い方
+## 使い方（GUI）
 
-1.最初のウィンドウ内で「この色に合わせたい」という映像を選ぶ
+1. アプリを起動（`video-stabilizer` または配布 `.exe`）
+2. **参照映像** … 合わせたい色味の動画を1本選択
+3. **処理対象** … ファイル追加 / フォルダ追加で補正したい動画を登録
+4. **出力** … 必要なら出力フォルダ・ファイル名 prefix/suffix・衝突時の動作を設定
+5. **実行** … 進捗とログを確認。キャンセルも可能
+6. 出力先（未指定時は各入力と同じ場所の `output_corrected/`）に補正済み動画ができます
 
-2.次のウィンドウ内で「補正したい映像のあるフォルダ」を選ぶ
+### プリセット
+- **standard** … バランス型（既定）
+- **natural** … 弱めの補正
+- **strong** … 強めの補正
 
-3.終わったら「補正したい映像のあるフォルダ」内に"output_corrected"というフォルダがあるので、その中に調整済映像ができる
+### CLI（従来方式）
+```bash
+video-stabilizer --cli
+```
+参照動画 → フォルダ選択の2段階ダイアログで処理します。
 
-4.各自のお好きに!
+## 準備（開発）
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) を参照してください。
 
-# 最後に
+## 配布
+Releases から `SBC_VideoStabilizer_vXX.exe` を取得して実行できます。
 
-問題があればIssuesへ
+## 問題報告
+Issues へお願いします。

@@ -45,7 +45,7 @@ class TestMux(unittest.TestCase):
         mock_open.return_value = source
 
         self.assertTrue(remux_preserve_audio("src.mp4", "vid.avi", "out.mp4"))
-        mock_video_only.assert_called_once_with("vid.avi", "out.mp4")
+        mock_video_only.assert_called_once_with("vid.avi", "out.mp4", color_meta=None)
 
     @patch("video_stabilizer.mux.remux_preserve_audio", return_value=True)
     @patch("video_stabilizer.mux.os.replace")

@@ -1,4 +1,7 @@
-# パイプライン系
+# ターゲット動画のデコード → 統計補間 → 並列色補正 → 書き出し → 音声 remux
+#
+# OpenCV VideoWriter は音声非対応のため、一旦 .vs-video-only.avi に書き、
+# 最後に mux.py で元ファイルの音声を stream copy して結合する。
 
 from __future__ import annotations
 
@@ -6,13 +9,17 @@ import concurrent.futures
 import logging
 import math
 import os
+import threading
 from collections import deque
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import av
 import cv2
 import numpy as np
 from tqdm import tqdm
 
+from video_stabilizer.color_metadata import ColorMetadata, read_color_metadata
 from video_stabilizer.config import Config, FrameFailurePolicy
 from video_stabilizer.mux import finalize_output_with_audio
 from video_stabilizer.stats import (
@@ -25,17 +32,84 @@ from video_stabilizer.stats import (
 )
 from video_stabilizer.worker import process_frame_worker
 
+if TYPE_CHECKING:
+    pass
+
 logger = logging.getLogger(__name__)
 PendingFuture = concurrent.futures.Future | None
 
-# OpenCV on Windows is unreliable with mp4/tmp paths; use AVI for the intermediate file.
 _INTERMEDIATE_SUFFIX = ".vs-video-only.avi"
 _WRITER_CODEC_FALLBACKS = ("mp4v", "XVID", "MJPG", "DIVX")
+
+ProgressCallback = Callable[[int, int | None], None]
+
+
+class _NullProgress:
+    def update(self, _n: int = 1) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
 
 
 def _video_only_temp_path(out_path: str) -> str:
     base, _ = os.path.splitext(out_path)
     return base + _INTERMEDIATE_SUFFIX
+
+
+def detect_vfr(stream: av.stream.Stream, threshold: float = 0.05) -> bool:
+    """Heuristic VFR detection from stream rate metadata (no extra decode pass)."""
+    avg = float(stream.average_rate) if stream.average_rate else 0.0
+    base = float(stream.base_rate) if getattr(stream, "base_rate", None) else 0.0
+    if avg > 0 and base > 0:
+        return abs(avg - base) / avg > threshold
+    # Some containers expose guessed_rate differing from average_rate
+    guessed = float(stream.guessed_rate) if getattr(stream, "guessed_rate", None) else 0.0
+    if avg > 0 and guessed > 0:
+        return abs(avg - guessed) / avg > threshold
+    return False
+
+
+def _safe_rate_to_float(rate: object | None) -> float | None:
+    if rate is None:
+        return None
+    try:
+        value = float(rate)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+def _resolve_fps(stream: av.stream.Stream, config: Config) -> float:
+    for rate in (
+        getattr(stream, "average_rate", None),
+        getattr(stream, "guessed_rate", None),
+        getattr(stream, "base_rate", None),
+    ):
+        resolved = _safe_rate_to_float(rate)
+        if resolved is not None:
+            return resolved
+    return config.default_fps
+
+
+def _estimate_total_frames(stream: av.stream.Stream, fps: float, config: Config) -> int:
+    frames = getattr(stream, "frames", 0) or 0
+    if frames > 0:
+        return int(frames)
+    duration = getattr(stream, "duration", None)
+    time_base = getattr(stream, "time_base", None)
+    if duration is not None and time_base is not None:
+        try:
+            seconds = float(duration * time_base)
+            if seconds > 0:
+                estimated = int(seconds * fps)
+                if estimated > 0:
+                    return estimated
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return config.fallback_frame_estimate
 
 
 def _create_video_writer(
@@ -70,10 +144,14 @@ class _FrameWriteState:
     def __init__(
         self,
         out: cv2.VideoWriter,
-        pbar: tqdm,
+        pbar: tqdm | _NullProgress,
         config: Config,
         height: int,
         width: int,
+        *,
+        progress_cb: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+        total_frames: int | None = None,
     ) -> None:
         self._out = out
         self._pbar = pbar
@@ -82,6 +160,22 @@ class _FrameWriteState:
         self._last_good: np.ndarray | None = None
         self._black = np.zeros((height, width, 3), dtype=np.uint8)
         self.aborted = False
+        self._progress_cb = progress_cb
+        self._cancel_event = cancel_event
+        self._total_frames = total_frames
+        self._written = 0
+
+    def _check_cancel(self) -> bool:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            self.aborted = True
+            return True
+        return False
+
+    def _notify_progress(self) -> None:
+        self._written += 1
+        self._pbar.update(1)
+        if self._progress_cb is not None:
+            self._progress_cb(self._written, self._total_frames)
 
     def _placeholder(self) -> np.ndarray | None:
         if self._policy == "black":
@@ -93,11 +187,13 @@ class _FrameWriteState:
         return None
 
     def resolve(self, frame: np.ndarray | None, frame_idx: int) -> bool:
-        """Write one output frame. Returns False if processing should abort."""
+        if self._check_cancel():
+            return False
+
         if frame is not None:
             self._out.write(frame)
             self._last_good = frame
-            self._pbar.update(1)
+            self._notify_progress()
             return True
 
         logger.warning("Frame %s processing failed", frame_idx)
@@ -111,7 +207,7 @@ class _FrameWriteState:
             return False
 
         self._out.write(placeholder)
-        self._pbar.update(1)
+        self._notify_progress()
         return True
 
 
@@ -128,7 +224,11 @@ def _write_next_ready(
     next_frame_to_write: int,
     write_state: _FrameWriteState,
 ) -> int:
+    # ワーカーはフレーム順不同で完了するため、next_frame_to_write から
+    # 連続して完了済みの Future だけを順番に書き出す（動画は PTS 順が必須）。
     while next_frame_to_write in futures:
+        if write_state._check_cancel():
+            return next_frame_to_write
         pending = futures[next_frame_to_write]
         if pending is not None and not pending.done():
             break
@@ -146,7 +246,11 @@ def _drain_backpressure(
     write_state: _FrameWriteState,
     max_queue_size: int,
 ) -> int:
+    # キューが max_queue_size を超えたら、書き出し待ちの先頭 Future を
+    # ブロッキングで待って消化する（メモリ爆発とデコード先走りを防ぐ）。
     while len(futures) > max_queue_size:
+        if write_state._check_cancel():
+            return next_frame_to_write
         if next_frame_to_write not in futures:
             break
         pending = futures[next_frame_to_write]
@@ -167,6 +271,8 @@ def _drain_all_futures(
     write_state: _FrameWriteState,
 ) -> int:
     while next_frame_to_write < expected_frames:
+        if write_state._check_cancel():
+            return next_frame_to_write
         if next_frame_to_write in futures:
             pending = futures[next_frame_to_write]
             if pending is not None and not pending.done():
@@ -210,6 +316,10 @@ def process_target_video(
     out_path: str,
     ref_avg_stats: np.ndarray,
     config: Config,
+    *,
+    progress_cb: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+    color_meta: ColorMetadata | None = None,
 ) -> bool:
     container = None
     out: cv2.VideoWriter | None = None
@@ -224,9 +334,16 @@ def process_target_video(
             return False
 
         stream = container.streams.video[0]
-        fps = float(stream.average_rate)
-        if fps <= 0 or math.isnan(fps):
-            fps = config.default_fps
+        if color_meta is None:
+            color_meta = read_color_metadata(stream)
+
+        if detect_vfr(stream, config.vfr_threshold):
+            logger.warning(
+                "VFR の可能性があります。フレーム順序ベースで処理します（音声は元PTSでトリム）: %s",
+                app_path,
+            )
+
+        fps = _resolve_fps(stream, config)
 
         w, h = stream.width, stream.height
         video_only_path = _video_only_temp_path(out_path)
@@ -237,14 +354,17 @@ def process_target_video(
             return False
 
         N = get_optimal_sampling_interval(fps, config.target_sampling_sec)
-        total_app_frames = (
-            stream.frames
-            if stream.frames > 0
-            else int(float(stream.duration * stream.time_base) * stream.average_rate)
-        )
-        if total_app_frames <= 0:
-            total_app_frames = config.fallback_frame_estimate
+        total_app_frames = _estimate_total_frames(stream, fps, config)
+        # キーフレームが 3 点未満だと Mitchell 補間が成立しないため、
+        # 短尺はフレームごとに EMA で current_stats を直接更新する。
         is_short_video = total_app_frames <= (N * 3)
+
+        stats_kw = dict(
+            y_offset=color_meta.y_offset,
+            y_scale=color_meta.y_scale,
+            uv_offset=color_meta.uv_offset,
+            uv_scale=color_meta.uv_scale,
+        )
 
         stats_buffer: list[tuple[int, np.ndarray]] = []
         frames_buffer: deque[tuple[int, tuple[np.ndarray, np.ndarray, np.ndarray]]] = deque()
@@ -260,20 +380,38 @@ def process_target_video(
         max_queue_size = max_workers * config.queue_multiplier
         f_idx = 0
 
-        pbar_total = total_app_frames if total_app_frames > config.tqdm_total_threshold else None
-        pbar = tqdm(total=pbar_total, desc=os.path.basename(app_path)[:20])
+        use_tqdm = not config.use_gui_progress
+        if use_tqdm and total_app_frames > config.tqdm_total_threshold:
+            pbar: tqdm | _NullProgress = tqdm(
+                total=total_app_frames, desc=os.path.basename(app_path)[:20]
+            )
+        else:
+            pbar = _NullProgress()
 
         if is_short_video:
             logger.info("Short video (%sF est.): direct EMA mode", total_app_frames)
         else:
             logger.info("Sampling every %s frames (Mitchell interpolation mode)", N)
-        write_state = _FrameWriteState(out, pbar, config, h, w)
+
+        write_state = _FrameWriteState(
+            out,
+            pbar,
+            config,
+            h,
+            w,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            total_frames=total_app_frames if total_app_frames > 0 else None,
+        )
 
         def submit_frame(
             frame_idx: int,
             yuv: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
             current_stats: np.ndarray,
         ) -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                write_state.aborted = True
+                return
             if yuv is None:
                 if config.on_frame_failure == "abort":
                     write_state.aborted = True
@@ -289,6 +427,7 @@ def process_target_video(
                 current_stats,
                 ref_avg_stats,
                 config,
+                color_meta,
             )
 
         def flush_buffered_frame(
@@ -301,17 +440,22 @@ def process_target_video(
 
         try:
             logger.info(
-                "Processing %s (%sx%s @ %.2ffps)",
+                "Processing %s (%sx%s @ %.2ffps, range=%s)",
                 os.path.basename(app_path),
                 w,
                 h,
                 fps,
+                "full" if color_meta.is_full_range else "limited",
             )
 
             for frame in container.decode(stream):
-                target_yuv = extract_yuv_planes(frame)
-                if write_state.aborted:
+                if write_state.aborted or (
+                    cancel_event is not None and cancel_event.is_set()
+                ):
+                    write_state.aborted = True
                     break
+
+                target_yuv = extract_yuv_planes(frame)
 
                 if is_short_video:
                     if target_yuv is not None:
@@ -320,6 +464,7 @@ def process_target_video(
                             target_yuv[1],
                             target_yuv[2],
                             config.stats_max_dim,
+                            **stats_kw,
                         )
                         if ema_stats is None:
                             ema_stats = s
@@ -336,8 +481,11 @@ def process_target_video(
                                 target_yuv[1],
                                 target_yuv[2],
                                 config.stats_max_dim,
+                                **stats_kw,
                             )
                             stats_buffer.append((f_idx, s))
+                        # Mitchell 補間には前後のキーフレームが必要なので、
+                        # 十分な lookahead が溜まるまで frames_buffer に保持する。
                         frames_buffer.append((f_idx, target_yuv))
 
                         buffer_limit = int(N * config.buffer_frames_multiplier)
@@ -374,6 +522,8 @@ def process_target_video(
             expected_frames = f_idx
 
             if not write_state.aborted and not is_short_video:
+                # デコード終了後: 末尾に残ったバッファを tail 補間で flush。
+                # キーフレーム不足で補間できない場合は warmup から EMA を初期化して代替する。
                 while frames_buffer:
                     buf_f_idx, buf_target = frames_buffer.popleft()
                     interp_s = interpolate_stats_tail(
@@ -385,7 +535,10 @@ def process_target_video(
                     if interp_s is None:
                         if ema_stats is None:
                             ema_stats = init_ema_with_warmup(
-                                list(warmup_buffer), ema_alpha, config.stats_max_dim
+                                list(warmup_buffer),
+                                ema_alpha,
+                                config.stats_max_dim,
+                                **stats_kw,
                             )
                             if ema_stats is None:
                                 ema_stats = get_stats_and_coeffs(
@@ -393,12 +546,14 @@ def process_target_video(
                                     buf_target[1],
                                     buf_target[2],
                                     config.stats_max_dim,
+                                    **stats_kw,
                                 )
                         s = get_stats_and_coeffs(
                             buf_target[0],
                             buf_target[1],
                             buf_target[2],
                             config.stats_max_dim,
+                            **stats_kw,
                         )
                         ema_stats = ema_alpha * s + (1 - ema_alpha) * ema_stats
                         interp_s = ema_stats
@@ -413,12 +568,16 @@ def process_target_video(
                     write_state,
                 )
 
+            cancelled = cancel_event is not None and cancel_event.is_set()
             success = (
                 not write_state.aborted
+                and not cancelled
                 and next_frame_to_write == expected_frames
                 and len(futures) == 0
             )
-            if not success:
+            if cancelled:
+                logger.info("Processing cancelled: %s", app_path)
+            elif not success:
                 logger.error(
                     "Processing incomplete for %s: wrote %s/%s frames",
                     app_path,
@@ -441,6 +600,7 @@ def process_target_video(
                 video_only_path,
                 out_path,
                 preserve_audio=config.preserve_audio,
+                color_meta=color_meta,
             )
         if not success:
             _remove_partial_output(out_path)

@@ -1,32 +1,29 @@
-# まあなんか処理系
+# アプリケーションエントリ
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
+import sys
 
 from video_stabilizer.config import Config
+from video_stabilizer.files import collect_targets
+from video_stabilizer.job_runner import run_batch
 from video_stabilizer.logging_setup import configure_logging
-from video_stabilizer.pipeline import process_target_video
-from video_stabilizer.reference import analyze_reference_video
 from video_stabilizer.ui import select_file, select_folder, shutdown_ui
 
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
-    configure_logging()
-    config = Config.from_env()
+def run_cli(config: Config | None = None) -> None:
+    """Legacy two-dialog CLI flow."""
+    base = config or Config.from_env()
+    cfg = Config(**{**base.to_serializable_dict(), "use_gui_progress": False})
 
     try:
         ref_path = select_file("参照映像(Lookの元)を選択してください")
         if not ref_path:
-            return
-
-        logger.info("--- 参照映像を解析中 ---")
-        ref_avg_stats = analyze_reference_video(ref_path, config)
-        if ref_avg_stats is None:
-            logger.error("参照映像から統計情報を取得できませんでした。")
             return
 
         target_folder = select_folder("適用先の映像が入っているフォルダを選択してください")
@@ -34,40 +31,40 @@ def main() -> None:
             logger.info("フォルダ選択がキャンセルされました。")
             return
 
-        target_files = [
-            f for f in os.listdir(target_folder) if f.lower().endswith(config.valid_extensions)
-        ]
-        if not target_files:
+        targets = collect_targets([target_folder], cfg.valid_extensions)
+        if not targets:
             logger.warning("対象の動画ファイルが見つかりませんでした。")
             return
 
-        out_dir = os.path.join(target_folder, config.output_subdir)
-        os.makedirs(out_dir, exist_ok=True)
-        logger.info("合計 %s 個の動画ファイルを処理します。", len(target_files))
-
-        ok_count = 0
-        fail_count = 0
-        for file_name in target_files:
-            app_path = os.path.join(target_folder, file_name)
-            out_path = os.path.join(out_dir, f"{config.output_prefix}{file_name}")
-            try:
-                if process_target_video(app_path, out_path, ref_avg_stats, config):
-                    ok_count += 1
-                else:
-                    fail_count += 1
-                    logger.error("処理失敗: %s", file_name)
-            except Exception:
-                logger.exception("ファイル処理中に予期せぬエラー: %s", file_name)
-                fail_count += 1
-                continue
-
+        manifest_path = os.path.join(target_folder, "manifest.json")
+        result = run_batch(ref_path, targets, cfg, manifest_path=manifest_path)
         logger.info(
-            "--- すべての処理が完了しました (成功: %s, 失敗: %s) ---",
-            ok_count,
-            fail_count,
+            "--- 処理完了 (成功: %s, 失敗: %s, スキップ: %s) ---",
+            result.ok_count,
+            result.fail_count,
+            result.skip_count,
         )
     finally:
         shutdown_ui()
+
+
+def main(argv: list[str] | None = None) -> None:
+    configure_logging()
+    parser = argparse.ArgumentParser(description="Video Stabilizer — Look 転写")
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="GUI ではなく従来のファイルダイアログ CLI を起動",
+    )
+    args = parser.parse_args(argv)
+
+    if args.cli:
+        run_cli()
+        return
+
+    from video_stabilizer.gui import launch_gui
+
+    launch_gui()
 
 
 if __name__ == "__main__":
