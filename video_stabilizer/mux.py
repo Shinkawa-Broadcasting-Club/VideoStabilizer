@@ -7,6 +7,8 @@ import os
 
 import av
 
+from video_stabilizer.color_metadata import ColorMetadata, apply_metadata_to_stream
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +41,7 @@ def _mux_video_packets(
     video_only_path: str,
     output_path: str,
     out_container: av.container.OutputContainer,
+    color_meta: ColorMetadata | None = None,
 ) -> bool:
     video_in: av.container.InputContainer | None = None
     try:
@@ -49,6 +52,8 @@ def _mux_video_packets(
             return False
 
         out_v = _add_stream_from_template(out_container, in_v)
+        if color_meta is not None:
+            apply_metadata_to_stream(out_v, color_meta)
         for packet in video_in.demux(in_v):
             if packet.dts is None and packet.pts is None:
                 continue
@@ -63,12 +68,17 @@ def _mux_video_packets(
             video_in.close()
 
 
-def remux_video_only(video_only_path: str, output_path: str) -> bool:
+def remux_video_only(
+    video_only_path: str,
+    output_path: str,
+    *,
+    color_meta: ColorMetadata | None = None,
+) -> bool:
     """Remux corrected video into a container matching output_path extension."""
     out_container: av.container.OutputContainer | None = None
     try:
         out_container = av.open(output_path, mode="w")
-        return _mux_video_packets(video_only_path, output_path, out_container)
+        return _mux_video_packets(video_only_path, output_path, out_container, color_meta)
     except Exception:
         logger.exception("Failed to open output container: %s", output_path)
         return False
@@ -77,7 +87,13 @@ def remux_video_only(video_only_path: str, output_path: str) -> bool:
             out_container.close()
 
 
-def remux_preserve_audio(source_path: str, video_only_path: str, output_path: str) -> bool:
+def remux_preserve_audio(
+    source_path: str,
+    video_only_path: str,
+    output_path: str,
+    *,
+    color_meta: ColorMetadata | None = None,
+) -> bool:
     """Mux corrected video with audio copied from the source file.
 
     Uses stream copy (no re-encode). Trims audio to the corrected video duration.
@@ -94,7 +110,7 @@ def remux_preserve_audio(source_path: str, video_only_path: str, output_path: st
             logger.info("No audio in source; remuxing video only: %s", source_path)
             source.close()
             source = None
-            return remux_video_only(video_only_path, output_path)
+            return remux_video_only(video_only_path, output_path, color_meta=color_meta)
 
         video_in = av.open(video_only_path)
         in_v = video_in.streams.video[0]
@@ -107,6 +123,8 @@ def remux_preserve_audio(source_path: str, video_only_path: str, output_path: st
 
         out_container = av.open(output_path, mode="w")
         out_v = _add_stream_from_template(out_container, in_v)
+        if color_meta is not None:
+            apply_metadata_to_stream(out_v, color_meta)
         out_a = _add_stream_from_template(out_container, in_a)
 
         for packet in video_in.demux(in_v):
@@ -118,6 +136,8 @@ def remux_preserve_audio(source_path: str, video_only_path: str, output_path: st
             if pts_time is not None:
                 last_video_time = pts_time if last_video_time is None else max(last_video_time, pts_time)
 
+        # 補正後動画はフレーム数ベースで再エンコードされるため、元より短くなることがある
+        # （VFR や末尾ドロップ）。元音声は last_video_time を超えたパケットを捨てて長さを合わせる。
         for packet in source.demux(in_a):
             if packet.dts is None and packet.pts is None:
                 continue
@@ -151,18 +171,23 @@ def finalize_output_with_audio(
     output_path: str,
     *,
     preserve_audio: bool,
+    color_meta: ColorMetadata | None = None,
 ) -> bool:
     """Write final output in a container matching output_path extension."""
     if os.path.abspath(video_only_path) == os.path.abspath(output_path):
         return True
 
+    # 直接 output_path に書くと失敗時に部分ファイルが残るため、
+    # .vs-mux 一時ファイルへ書き込み後 os.replace でアトミックに差し替える。
     mux_tmp = _mux_temp_path(output_path)
     _remove_file(mux_tmp)
     try:
         if preserve_audio:
-            ok = remux_preserve_audio(source_path, video_only_path, mux_tmp)
+            ok = remux_preserve_audio(
+                source_path, video_only_path, mux_tmp, color_meta=color_meta
+            )
         else:
-            ok = remux_video_only(video_only_path, mux_tmp)
+            ok = remux_video_only(video_only_path, mux_tmp, color_meta=color_meta)
 
         if not ok:
             logger.error("Failed to finalize output: %s", output_path)

@@ -1,66 +1,58 @@
-# Tkinter系
+# Qt ファイルダイアログ（CLI 用）
 
 from __future__ import annotations
 
 import logging
 import sys
-import tkinter as tk
-from tkinter import filedialog
+
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 logger = logging.getLogger(__name__)
 
-_root: tk.Tk | None = None
+_owns_app: bool = False
+
+VIDEO_FILTER = "動画ファイル (*.mp4 *.avi *.mov *.mkv);;すべて (*.*)"
 
 
-def _ensure_root() -> tk.Tk:
-    """Return a single hidden root window for all file dialogs."""
-    global _root
-    if _root is None:
-        _root = tk.Tk()
-        _root.withdraw()
-        if sys.platform == "win32":
-            try:
-                _root.attributes("-topmost", True)
-            except tk.TclError:
-                pass
-    _root.update_idletasks()
-    _root.update()
-    return _root
+def _ensure_app() -> QApplication:
+    global _owns_app
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+        _owns_app = True
+    return app
 
 
 def shutdown_ui() -> None:
-    global _root
-    if _root is not None:
-        try:
-            _root.destroy()
-        except tk.TclError:
-            pass
-        _root = None
+    global _owns_app
+    if _owns_app:
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+            app.quit()
+        _owns_app = False
 
 
 def select_file(title: str) -> str:
-    root = _ensure_root()
+    _ensure_app()
     try:
-        file_path = filedialog.askopenfilename(
-            parent=root,
-            title=title,
-            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv")],
-        )
-        return file_path or ""
-    except tk.TclError:
+        path, _ = QFileDialog.getOpenFileName(None, title, "", VIDEO_FILTER)
+        return path or ""
+    except Exception:
         logger.exception("File dialog failed")
         return ""
 
 
 def select_folder(title: str) -> str:
-    root = _ensure_root()
+    _ensure_app()
     try:
-        folder_path = filedialog.askdirectory(
-            parent=root,
-            title=title,
-            mustexist=True,
+        path = QFileDialog.getExistingDirectory(
+            None,
+            title,
+            "",
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks,
         )
-        return folder_path or ""
-    except tk.TclError:
+        return path or ""
+    except Exception:
         logger.exception("Folder dialog failed")
         return ""

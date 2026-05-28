@@ -72,16 +72,19 @@ jobs:
           }
           "PYINSTALLER_NAME=$stem" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: PyInstaller (onefile, console)
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: PyInstaller (onefile, windowed GUI)
         shell: pwsh
         run: |
           pyinstaller --onefile `
+            --windowed `
             --name $env:PYINSTALLER_NAME `
             --collect-binaries av `
             --collect-binaries cv2 `
             --collect-submodules numexpr `
-            --hidden-import tkinter `
-            --hidden-import tkinter.filedialog `
+            --exclude-module tkinter `
             main.py
 
       - name: Upload artifact
