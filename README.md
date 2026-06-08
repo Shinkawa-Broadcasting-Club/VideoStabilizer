@@ -1,3 +1,7 @@
+# 20260608-updated
+
+vidstab_opt.pyを参照
+
 # Video Stabilizer
 
 参照映像のルック（輝度・コントラスト・色相・彩度）を、処理対象の動画へ転写する Windows 向けツールです。
